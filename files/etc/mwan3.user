@@ -10,6 +10,8 @@
 # $ACTION
 #      <ifup>         Is called by netifd and mwan3track.
 #      <ifdown>       Is called by netifd and mwan3track.
+#      <ifupdate>     Is called by netifd on in-place address/route change
+#                     (DHCP renew, wwand proto renew). Not a link flap.
 #      <connected>    Is only called by mwan3track if tracking was successful.
 #      <disconnected> Is only called by mwan3track if tracking has failed.
 # $INTERFACE	Name of the interface an action relates to (e.g. "wan" or "wwan").

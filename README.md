@@ -712,13 +712,13 @@ start rtmon_ipv4 + rtmon_ipv6                # route monitor daemons
 
 ### 6.6 `etc/hotplug.d/iface/25-mwan3`
 
-Handles interface state change events from netifd. Triggered on `ifup`, `ifdown`, `connected`, and `disconnected` actions.
+Handles interface state change events from netifd. Triggered on `ifup`, `ifdown`, `ifupdate`, `connected`, and `disconnected` actions.
 
 #### Guard Checks
 
 1. Valid action and interface name
 2. Not first-connect or shutdown
-3. Device present for ifup/connected
+3. Device present for ifup/connected/ifupdate
 4. procd lock (unless called from init)
 5. Service is running (`$MWAN3_STATUS_DIR` exists)
 6. nft framework is loaded (`nft list chain inet mwan3 mwan3_prerouting` succeeds)
@@ -731,6 +731,7 @@ There is no `fw4 reload` detection. `table inet mwan3` is unaffected by fw4 relo
 | Action | Operations |
 |---|---|
 | `ifup` | Update peer track IP (if `track_gateway` enabled), create interface nft chain, create ip rules, create routes, set hotplug state. If not init: set general rules. If online and not init: rebuild policies (nft batch), flush worse-metric sticky sets, flush unreplied conntrack. Signal tracker with USR2. |
+| `ifupdate` | In-place address/route/prefix/data change (`IFUPDATE_ADDRESSES`/`ROUTES`/`PREFIXES`/`DATA`). Update peer track IP, recreate interface nft chain, ip rules and routes. Signal tracker with HUP so it re-reads `SRC_IP`. Does **not** change online/offline or rebuild policies. |
 | `ifdown` | Set offline state. Rebuild policies + flush sticky sets (one nft batch). Delete ip rules, delete routes, delete interface nft chain. Signal tracker with USR1. Flush conntrack. |
 | `connected` | Set online state. Create interface nft chain, create ip rules (no-op if already present), create routes (no-op if already present). Rebuild policies (nft batch). Flush worse-metric sticky sets. Flush unreplied conntrack. |
 | `disconnected` | Set offline state. Rebuild policies + flush sticky sets (one nft batch). Flush conntrack. |
@@ -803,7 +804,7 @@ Package build recipe. Key dependency changes:
 | | `+ucode-mod-log` |
 | | `+libnetfilter-conntrack` |
 
-`PKG_BUILD_DEPENDS` adds `libnetfilter_conntrack` and `libmnl` for the headers and libraries needed to compile `mwan3ct.c`. The runtime `+libnetfilter-conntrack` dependency provides the shared library that `mwan3ct` links against on the target.
+`PKG_BUILD_DEPENDS` 使用源码包目录名 `libnetfilter-conntrack` 和 `libmnl`，提供编译 `mwan3ct.c` 所需的头文件及库。运行依赖 `+libnetfilter-conntrack` 提供目标设备上的共享库；这里不能用上游 `PKG_NAME` 的下划线名称替代源码包目录名。
 
 `mwan3ipcheck.c` is also compiled in the same build step. It links only against libc (`inet_pton`, `strtol`, standard string functions) and requires no additional build or runtime dependencies.
 
@@ -988,7 +989,7 @@ Used by mwan3.sh to populate the `mwan3_connected_v4/v6` sets from the main tabl
 
 Per-interface routing table populator.
 
-Copies routes from the main routing table (and any additional tables listed in the `rt_table_lookup` UCI global) into a single per-interface routing table via RTM_NEWROUTE with NLM_F_CREATE | NLM_F_REPLACE. Uses ubus (`network.interface dump`) to map interface names to their kernel devices and table IDs; the `_4`/`_6` suffix convention for dual-stack interface pairs is recognised. Routes already present in the target table (matched by dst/oif/gateway/priority) are skipped. When `source_routing` is set, the route's source address is included in the copy.
+通过 `RTM_NEWROUTE` 和 `NLM_F_CREATE | NLM_F_REPLACE`，将主路由表及 `rt_table_lookup` 中的路由同步到指定接口表。使用 ubus 的 `network.interface dump` 映射接口名、设备和表 ID，支持 `_4`/`_6` 子接口。先安装不带网关的直连路由，再安装带网关的路由；完整替换路由属性，避免遗漏 `prefsrc`、源前缀或 metrics 的变化。启用 `source_routing` 时也复制源前缀。
 
 Replaces `ip route add table <id>` shell invocations that required fork-exec and text parsing of `ip route show` output.
 
@@ -1111,7 +1112,7 @@ See [§2 Connmark Operations](#connmark-operations) for the rationale and the ke
 | `mwan3_create_iface_rules iface device` | Adds `ip rule` entries: pref `id+MWAN3_IIF_RULE_BASE` (iif lookup) and pref `id+MWAN3_FWMARK_RULE_BASE` (fwmark lookup). For an IPv4 interface it also delegates to `mwan3-manage-rules.uc add-src` for the source lookup rules at pref `id+MWAN3_UNREACHABLE_RULE_BASE+MWAN3_INTERFACE_MAX+1`, one per global-scope IPv4 address on the device. The per-WAN unreachable backstop at `id+MWAN3_UNREACHABLE_RULE_BASE` is managed separately by `mwan3_set_member_backstops()` and is not installed here. |
 | `mwan3_rebuild_iface_rules iface` | Rebuilds a single interface's ip rules and routing table if the interface is enabled, its family is available, and it is currently up with an L3 device (verified via ubus). Called from `reload_service` via `config_foreach`, after the nft batch has committed, because ip rules and routes are kernel state that nftables does not own. Calls `mwan3_create_iface_rules()`, which deletes the interface's existing rules before adding them, then flushes and repopulates the routing table via `mwan3_delete_iface_route()` and `mwan3_create_iface_route()`. Unlike `mwan3_rebuild_iface_nft()` it does not consult the hotplug state file, so an interface that is up at netifd but tracked down keeps its routing in place. |
 | `mwan3_delete_iface_rules iface` | Removes the iif lookup, fwmark lookup and source lookup ip rules for this interface (both IPv4 and IPv6) by delegating to `mwan3-manage-rules.uc delete-iface`. The ucode script locates each rule by priority offset and table ID and deletes it via RTM_DELRULE. Handles rule-base changes and `mmx_mask` changes transparently. The unreachable backstop at `id+MWAN3_UNREACHABLE_RULE_BASE` is not deleted here; it persists until service stop. |
-| `mwan3_create_iface_route iface` | Copies routes from the main routing table (and any `rt_table_lookup` extra tables) into the per-interface routing table by invoking `mwan3-create-iface-route.uc`. The ucode script reads source routes via rtnl, skips routes already present in the target table, and writes each qualifying route with RTM_NEWROUTE. Passes the `source_routing` UCI flag to control whether source addresses are copied. |
+| `mwan3_create_iface_route iface` | 调用 `mwan3-create-iface-route.uc`，从主表和 `rt_table_lookup` 同步路由。先安装直连路由，再完整替换带网关路由及其属性。通过 `source_routing` 控制是否复制源前缀。 |
 | `mwan3_delete_iface_route iface` | Flushes the per-interface routing table. *Unchanged.* |
 
 ##### Handle-Based Rule Deletion
@@ -1218,7 +1219,7 @@ A set is pre-created at most once per render. Kernel queries inside an open batc
 
 | Function | Purpose |
 |---|---|
-| `main()` | Entry point. Parses the address family from `ARGV[0]` (`ipv4`/`ipv6`), opens syslog with `log_open`, loads config, connects to ubus, and binds the rtnl route listener before running the initial dumps so route changes during the dump phase are queued rather than lost to a subscribe-vs-dump race. Runs the initial custom-set, connected-set, per-interface-route, and route-state population, installs SIGTERM/SIGINT/SIGHUP handlers (SIGHUP reloads config and re-sweeps), arms a 20-second defensive route-state re-sweep (the nested `schedule_periodic_route_sweep()`), then enters the uloop event loop. One process runs per family. |
+| `main()` | Entry point. Parses the address family from `ARGV[0]` (`ipv4`/`ipv6`), opens syslog with `log_open`, loads config, connects to ubus, and binds the rtnl route listener before running the initial dumps so route changes during the dump phase are queued rather than lost to a subscribe-vs-dump race. Runs the initial custom-set, connected-set, per-interface-route, and route-state population, installs SIGTERM/SIGINT/SIGHUP handlers (SIGHUP reloads config and re-sweeps), arms a 20-second route reconciliation (the nested `schedule_periodic_route_sweep()`): 每次先为活动接口重同步路由，修复首次写入失败或漏事件造成的缺项，再更新 ROUTE_STATUS；不会清空路由表。Then enters the uloop event loop. One process runs per family. |
 | `log_msg(level, msg)` | Local logging wrapper that prefixes the `[family]` tag and delegates to `common.uc`'s `log_msg` (imported as `mlog`). |
 | `load_config()` | Loads the `mwan3` UCI config: sets the verbose gate via `log_verbose(ucibool(...))`, reads `mmx_mask` and `source_routing`, builds `extra_table_set` from `rt_table_lookup`, and builds `iface_list` (name, family, sequential table id, enabled, has_tracking) in UCI declaration order. Called at startup and on SIGHUP. |
 | `build_dev_table_map()` | From the ubus `network.interface` dump, maps each enabled same-family interface's `l3_device` to its table id in `dev_table_map`. |
@@ -1268,11 +1269,12 @@ A set is pre-created at most once per render. Kernel queries inside an open batc
 | `connecting` | Enters the transitional `connecting` state once and fires the `connecting` hotplug event, an early signal before the interface is declared online. |
 | `disabled` | Marks the interface `disabled` and calls `stopped`. |
 | `firstconnect` | Resolves the true interface, L3 device, and source IP, determines the initial status (`initial_state`, default online), marks the tracker started, then calls `connected` or `disconnected` accordingly. Called at startup and after ifup. |
+| `refresh_src` | 每轮探测及 HUP 时清除 network.sh 缓存，先将接口状态、设备和源地址读入临时变量。仅在接口已 UP、设备非空、源地址不是空值或通配地址时更新绑定；失败时保留旧绑定并返回失败，本轮不发探测包，按失败轮次计分。地址或设备变化时记录 notice。 |
 | `stopped` | Sets `STARTED=0` and writes the `STARTED` status file; the tracker then idles until a signal. |
 | `started` | Sets `STARTED=1` and writes the `STARTED` status file. |
 | `update_status track_ip state [latency loss]` | Writes the per-target `TRACK_<ip>` status file (and, when supplied, `LATENCY_<ip>`/`LOSS_<ip>`) for one probe target. |
 | `load_tracking_config` | Reads all per-interface tracking UCI options (family, track_method, reliability, count, timeout, interval, up/down thresholds, size, max_ttl, failure/recovery intervals, check_quality and its latency/loss thresholds), clamping `check_quality` off for track methods that produce no latency/loss samples. Called at startup and on `HUP` reload. |
-| `main iface` | Entry point and probe loop. Takes the per-interface lock and writes `PID`, installs the signal traps, loads config and the probe-target list, then loops: each round it reads `ROUTE_STATUS` (a `down` written by `mwan3rtmon` counts as a failed round with no probing), probes each target with `WRAP`, adjusts the hysteresis score, and calls the state transitions; between rounds it services pending ifdown/ifup/reload events. |
+| `main iface` | Entry point and probe loop. Takes the per-interface lock and writes `PID`, installs the signal traps, loads config and the probe-target list, then loops: each round it services pending ifdown/ifup/reload events, re-reads `DEVICE`/`SRC_IP`, reads `ROUTE_STATUS` (a `down` written by mwan3rtmon counts as a failed round with no probing), probes each target with `WRAP`, adjusts the hysteresis score, and calls the state transitions; between rounds it services pending ifdown/ifup/reload events. |
 
 The nested helpers `mwan3_load_track_ips` and `mwan3_list_track_ips`, defined inside `main()`, assemble the probe-target list (static `track_ip` entries plus the discovered gateway when `track_gateway` is set) and prune stale per-target status files; they are not listed separately.
 
@@ -1459,6 +1461,19 @@ connected fires for $INTERFACE (link-layer negotiation, or tracker recovery)
 ```
 
 The `connected` action fires on two distinct events: link-layer negotiation completion (PPPoE authentication, for example) after `ifup` routing state is already in place, and tracker recovery, when mwan3track judges a previously-failed interface to be working again without a physical reconnect. On a tracker recovery the interface's routing rules and route may have been removed by a prior `ifdown`; the `connected` arm recreates them unconditionally so the interface is fully routable before the policy re-selects it. On an ordinary link-negotiation event the routing is already in place and the recreate calls are harmless no-ops. The snap-back (`mwan3_flush_worse_metric_sticky`) returns new flows from lower-ranked same-family backups to the recovered interface; established flows on those backups are left to complete undisturbed.
+
+```
+netifd signals ifupdate for $INTERFACE (address/route/prefix/data)
+  +--> 25-mwan3 hotplug script
+       +--> [no IFUPDATE_* flags]       exit (link-only noise)
+       +--> mwan3_update_peer_track_ip()   write gateway IP (track_gateway)
+       +--> mwan3_create_iface_nft()       recreate chain (v6 SNAT follows new GUA)
+       +--> mwan3_create_iface_rules()     recreate ip rules (idempotent)
+       +--> mwan3_create_iface_route()     copy current routes to per-iface table
+       +--> procd_send_signal track_$INTERFACE HUP
+```
+
+`ifupdate` is the path taken by an in-place proto renew (DHCP address change, wwand session reconnect, PPPoE IPCP renegotiation). netifd does not emit ifdown/ifup, so without this arm the per-interface table and the tracker's `SRC_IP` stay on the previous address, every wrapped ping fails to bind, and the member stays offline until a manual `mwan3 ifup`. The HUP wakes the tracker from its sleep so the next probe round uses the new source address; hysteresis is left intact.
 
 #### Automatic Gateway Tracking (`track_gateway`)
 

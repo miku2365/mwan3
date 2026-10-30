@@ -96,12 +96,8 @@ for (let r in all_routes) {
 		push(source_routes, r);
 }
 
-let existing_keys = {};
-for (let r in all_routes) {
-	if (r.table != table_id) continue;
-	let key = (r.dst ?? "") + "|" + (r.oif ?? "") + "|" + (r.gateway ?? "") + "|" + (r.priority ?? "");
-	existing_keys[key] = true;
-}
+// 先安装直连路由，再安装依赖网关的路由，避免 /32 网关尚未可达。
+sort(source_routes, (a, b) => (a.gateway != null) - (b.gateway != null));
 
 for (let route in source_routes) {
 	let dev = route.oif;
@@ -113,9 +109,7 @@ for (let route in source_routes) {
 		continue;
 	}
 
-	let key = (route.dst ?? "") + "|" + (route.oif ?? "") + "|" + (route.gateway ?? "") + "|" + (route.priority ?? "");
-	if (existing_keys[key]) continue;
-
+	// 完整替换属性；仅按目的地址/设备/网关/metric 去重会漏掉源地址变化。
 	let r = build_route_for_table(route, table_id, source_routing);
 	rtnl.request(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, r);
 	let err = rtnl.error();

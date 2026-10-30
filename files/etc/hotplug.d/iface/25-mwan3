@@ -9,11 +9,11 @@ initscript=/etc/init.d/mwan3
 
 
 SCRIPTNAME="mwan3-hotplug"
-[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || [ "$ACTION" = "connected" ] || [ "$ACTION" = "disconnected" ] || exit 1
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifdown" ] || [ "$ACTION" = "connected" ] || [ "$ACTION" = "disconnected" ] || [ "$ACTION" = "ifupdate" ] || exit 1
 [ -n "$INTERFACE" ] || exit 2
 [ "$FIRSTCONNECT" = "1" ] || [ "$MWAN3_SHUTDOWN" = "1" ] && exit 0
 
-if { [ "$ACTION" = "ifup" ] || [ "$ACTION" = "connected" ] ; } && [ -z "$DEVICE" ]; then
+if { [ "$ACTION" = "ifup" ] || [ "$ACTION" = "connected" ] || [ "$ACTION" = "ifupdate" ] ; } && [ -z "$DEVICE" ]; then
 	LOG notice "$ACTION called on $INTERFACE with no device set"
 	exit 3
 fi
@@ -95,6 +95,19 @@ case "$ACTION" in
 			fi
 		fi
 		[ "$ACTION" = ifup ] && procd_running mwan3 "track_$INTERFACE" && procd_send_signal mwan3 "track_$INTERFACE" USR2
+		;;
+	ifupdate)
+		# In-place address/route change (DHCP renew, wwand proto renew).
+		# Rebuild this member's nft/rules/routes so they follow the new
+		# source address, but do not flip tracker online/offline — the
+		# probe loop re-reads SRC_IP each round and hysteresis still applies.
+		[ -n "$IFUPDATE_ADDRESSES" ] || [ -n "$IFUPDATE_ROUTES" ] || \
+			[ -n "$IFUPDATE_PREFIXES" ] || [ -n "$IFUPDATE_DATA" ] || exit 0
+		mwan3_update_peer_track_ip $INTERFACE
+		mwan3_create_iface_nft $INTERFACE $DEVICE
+		mwan3_create_iface_rules $INTERFACE $DEVICE
+		mwan3_create_iface_route $INTERFACE $DEVICE
+		procd_running mwan3 "track_$INTERFACE" && procd_send_signal mwan3 "track_$INTERFACE" HUP
 		;;
 	disconnected)
 		# A soft tracker failure drops the member from the policy; flush its

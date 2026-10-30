@@ -110,14 +110,14 @@ function load_config() {
 
 function build_dev_table_map() {
 
-	dev_table_map = {};
-
 	if (!ubus_conn)
-		return;
+		return false;
 
 	let dump = ubus_conn.call("network.interface", "dump");
 	if (!dump || !dump.interface)
-		return;
+		return false;
+
+	dev_table_map = {};
 
 	// Build name->tid lookup for enabled interfaces in this family
 
@@ -132,6 +132,7 @@ function build_dev_table_map() {
 		if (tid != null && intf.l3_device)
 			dev_table_map[intf.l3_device] = tid;
 	}
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -548,7 +549,9 @@ function populate_connected_set() {
 
 function populate_iface_routes() {
 
-	build_dev_table_map();
+	// 查询失败时不能把 WAN 专属路由当成公共路由广播到其他表。
+	if (!build_dev_table_map())
+		return;
 	refresh_active_chains();
 
 	let routes = get_all_routes();
@@ -556,6 +559,9 @@ function populate_iface_routes() {
 
 	if (length(keys(active_tids)) == 0)
 		return;
+
+	// 网关主机路由先到位，再安装默认路由；后续定时重同步修复写入竞态。
+	sort(routes, (a, b) => (a.gateway != null) - (b.gateway != null));
 
 	for (let route in routes) {
 		let dev = route.oif;
@@ -565,19 +571,15 @@ function populate_iface_routes() {
 
 			// Route has a device that maps to a specific interface table
 
-			if (active_tids["" + target_tid] != null) {
-				let r = build_route_for_table(route, target_tid);
-				rtnl.request(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, r);
-			}
+			if (active_tids["" + target_tid] != null)
+				apply_route_to_table(route, target_tid, true);
 
 		} else if (!is_default_route(route) && !is_linklocal_route(route)) {
 
 			// Broadcast to all active interface tables
 
-			for (let tid_str in keys(active_tids)) {
-				let r = build_route_for_table(route, +tid_str);
-				rtnl.request(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, r);
-			}
+			for (let tid_str in keys(active_tids))
+				apply_route_to_table(route, +tid_str, true);
 		}
 	}
 }
@@ -689,7 +691,9 @@ function handle_route_event(event) {
 
 	// -- Update per-interface routing tables --
 
-	build_dev_table_map();
+	// 查询失败时不能把 WAN 专属路由当成公共路由广播到其他表。
+	if (!build_dev_table_map())
+		return;
 	refresh_active_chains();
 
 	// For delete events, verify the route is actually gone
@@ -828,14 +832,12 @@ function main() {
 		refresh_route_states();
 	});
 
-	// Slow periodic re-sweep as defense in depth: bounds recovery if a
-	// route-state change ever arrives without an accompanying main-table
-	// route event (a coalesced or missed netlink multicast). It is cheap
-	// and silent when nothing moves, since write_route_state only writes
-	// on an actual change.
+	// 每 20 秒重同步活动接口的路由，再检查状态。写入失败后即使没有新的
+	// netlink 事件，也能在下次同步补齐；不清空路由表，避免额外断流。
 
 	function schedule_periodic_route_sweep() {
 		uloop.timer(20000, () => {
+			populate_iface_routes();
 			refresh_route_states();
 			schedule_periodic_route_sweep();
 		});
